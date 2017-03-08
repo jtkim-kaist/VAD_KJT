@@ -1,3 +1,4 @@
 Data/
 fake/
 __pycache__/
+*.swp
