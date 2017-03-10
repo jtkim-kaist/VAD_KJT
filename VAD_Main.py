@@ -3,6 +3,7 @@ import numpy as np
 import utils as utils
 import re
 import datareader as dr
+import os
 
 from tensorflow.contrib import legacy_seq2seq as seq2seq
 from tensorflow.contrib.rnn import core_rnn_cell as rnn_cell
@@ -10,13 +11,28 @@ from tensorflow.contrib import rnn
 
 FLAGS = tf.flags.FLAGS
 
-file_dir = "/home/sbie/github/VAD_KJT/Data/data_2017_0302/Aurora2withSE"
+file_dir = "/home/sbie/github/VAD_KJT/Data/data_0302_2017/Aurora2withSE"
 input_dir = file_dir + "/Noisy_Aurora_STFT_npy"
-output_dir = file_dir + "/labels"
+output_dir = file_dir + "/label_checked"
 
+valid_file_dir = "/home/sbie/github/VAD_KJT/Data/data_0308_2017/Aurora2withNX"
+valid_input_dir = valid_file_dir + "/Noisy_Aurora_STFT_npy/Babble/SNR_10"
+valid_output_dir = valid_file_dir + "/labels"
+
+logs_dir = "/home/sbie/github/VAD_KJT/logs"
+
+reset = True  # remove all existed logs and initialize log directories
+eval_only = False  # if True, skip the training phase
+device = '/gpu:0'
+if reset:
+    os.popen('rm -rf ' + logs_dir + '/*')
+    os.popen('mkdir ' + logs_dir + '/train')
+    os.popen('mkdir ' + logs_dir + '/valid')
+
+num_valid_batches = 100
 learning_rate = 0.001
-num_steps = 64
-batch_size = 16 # batch_size = 32
+num_steps = 32
+batch_size = 32  # batch_size = 32
 num_sbs = 16  # number of sub-bands
 fft_size = 256
 channel = 1
@@ -24,10 +40,10 @@ cell_size = 256
 cell_out_size = cell_size
 num_h1_sb_net = 128
 num_h2_sb_net = 256
-SMALL_NUM = 0.00001
-max_epoch = 1000000
+SMALL_NUM = 1e-4
+max_epoch = int(1e6)
 dropout_rate = 0.85
-
+decay = 0.9  # batch normalization decay factor
 
 assert fft_size % num_sbs == 0, "fft_size must be divisible by num_sbs."
 
@@ -42,19 +58,20 @@ def sb_sensor(bp, STFT):
     bp = tf.tile(bp, (1, 1, tf.to_int32(fft_size / num_sbs)))
     bp = tf.reshape(bp, (batch_size, -1, 1))
     bp = tf.tile(bp, (1, 1, channel))
-    #selected_sbs = bp * STFT  # element-wise multiplication
-    selected_sbs = STFT
+    selected_sbs = bp * STFT  # element-wise multiplication
+    # selected_sbs = STFT
     selected_sbs = tf.expand_dims(selected_sbs, 2)  # expand dimension for convolution
 
     return selected_sbs
 
 
-def sb_net(bp, STFT, reuse=False):
+def sb_net(bp, STFT, reuse=False, is_training=True):
     """
     get sub-band network output (input to recurrent neural network)
     :param bp: bernoulli process. shape = (batch_size, num_sbs, 1), elements in bp are 0 or 1.
     :param STFT: STFT. shape = (batch_size, fft_size/2, channel)
     :param reuse: reuse factor for variable scope. shape = True or False
+    :param is_training
     :return: sub-band network output. shape = (batch_size, fft_size/2, 1, channel)
     """
     selected_sbs = sb_sensor(bp, STFT)
@@ -62,15 +79,26 @@ def sb_net(bp, STFT, reuse=False):
         conv_out = conv_net(selected_sbs)
         last_conv = tf.squeeze(utils.conv2lstm_layer(conv_out["max_pool4_3"], num_h1_sb_net))
     with tf.variable_scope("fc_net", reuse=reuse):
-        last_fc = tf.nn.relu(affine_transform(tf.squeeze(bp), num_h1_sb_net, name="sb_net_1"))
+        last_fc = utils.batch_norm_affine_transform(tf.squeeze(bp), num_h1_sb_net, decay=decay,
+                                                    name="sb_net_1", is_training=is_training)
+        last_fc = tf.nn.relu(last_fc)
+        # last_fc = tf.nn.relu(affine_transform(tf.squeeze(bp), num_h1_sb_net, name="sb_net_1"))  # TODO batch norm
     with tf.variable_scope("sb_net_out", reuse=reuse):
-        sb_net_out = tf.nn.relu(affine_transform(last_conv, num_h2_sb_net, name="sb_net_2")
-                                + affine_transform(last_fc, num_h2_sb_net, name="sb_net_3"))
+
+        last_conv = utils.batch_norm_affine_transform(last_conv, num_h2_sb_net, decay=decay,
+                                                      name="sb_net_2", is_training=is_training)
+        last_conv = tf.nn.relu(last_conv)
+        last_fc = utils.batch_norm_affine_transform(last_fc, num_h2_sb_net, decay=decay,
+                                                    name="sb_net_3", is_training=is_training)
+        last_fc = tf.nn.relu(last_fc)
+        sb_net_out = last_conv + last_fc
+        # sb_net_out = tf.nn.relu(affine_transform(last_conv, num_h2_sb_net, name="sb_net_2")  # TODO batch norm
+        #                         + affine_transform(last_fc, num_h2_sb_net, name="sb_net_3"))
 
     return sb_net_out
 
 
-def conv_net(inputs):
+def conv_net(inputs, is_training=True):
     layers = (
         'index:1_1, type:conv, size:2, stride:1, fm:'+str(channel)+'->32',
         'index:1_2, type:relu',
@@ -100,6 +128,9 @@ def conv_net(inputs):
             # tensorflow: weights are [height, width, in_channels, out_channels]
 
             current = utils.conv2d_basic(current, kernels, bias, stride=stride)
+            current = tf.contrib.layers.batch_norm(current, decay=decay, is_training=is_training,
+                                                   updates_collections=None)
+        
         elif kind == 'relu':
             current = tf.nn.relu(current, name=kind+index)
         elif kind == 'max_pool':
@@ -117,26 +148,31 @@ def affine_transform(x, output_dim, name=None):
     assumes x.shape = (batch_size, num_features)
     """
 
-    w = tf.get_variable(name+"_w", [x.get_shape()[1], output_dim])
+    w = tf.get_variable(name+"_w", [x.get_shape()[1], output_dim], initializer=tf.contrib.layers.xavier_initializer())
     b = tf.get_variable(name+"_b", [output_dim], initializer=tf.constant_initializer(0.0))
 
     return tf.matmul(x, w) + b
 
 
-def get_sbs(cell_output, reuse=False):
+def get_sbs(cell_output, reuse=False, is_training=True):
 
     with tf.variable_scope("br_net", reuse=reuse):
-        br_out = tf.sigmoid(affine_transform(cell_output, num_sbs, name="br_net"))
+
+        br_out = utils.batch_norm_affine_transform(cell_output, num_sbs, decay=decay,
+                                                   name="br_net", is_training=is_training)
+        br_out = tf.sigmoid(br_out)
+        # br_out = tf.sigmoid(affine_transform(cell_output, num_sbs, name="br_net"))
     rand_seq = tf.random_uniform(br_out.get_shape().as_list(), minval=0, maxval=1)
     selected_sbs = tf.cast(tf.greater(br_out, rand_seq), tf.float32)
     return selected_sbs, br_out
 
 
-def inference(inputs, keep_prob):
+def inference(inputs, keep_prob, is_training=True):
     """
     VAD based on recurrent method
     :param inputs: input list. length = num_steps, shape = (batch_size, fft_size, channel)
     :param keep_prob:
+    :param is_training
     :return: cell_output, selected_sbs, br_out are list with length num_steps, shape = (batch_size, cell_out_size),
      (batch_size, num_sbs), (batch_size, num_sbs)
     """
@@ -154,9 +190,9 @@ def inference(inputs, keep_prob):
             if time_step is 0:
                 reuse = False
                 sbs_ini = tf.ones([batch_size, num_sbs, 1])
-                sb_net_out = sb_net(sbs_ini, inputs[time_step], reuse=reuse)
+                sb_net_out = sb_net(sbs_ini, inputs[time_step], reuse=reuse, is_training=is_training)  # TODO batch norm
                 (cell_output, cell_state) = lstm_cell(sb_net_out, initial_state)
-                selected_sbs, br_out = get_sbs(cell_output, reuse=reuse)
+                selected_sbs, br_out = get_sbs(cell_output, reuse=reuse, is_training=is_training)  # TODO batch norm
                 selected_sbs = tf.expand_dims(selected_sbs, 2)
 
                 cell_output_list.append(cell_output)
@@ -175,9 +211,9 @@ def inference(inputs, keep_prob):
 
                 br_out_list.append(br_out)
 
-    # cell_output = tf.stack(cell_output_list, 1)
-    # selected_sbs = tf.stack(selected_sbs_list, 1)
-    # br_out = tf.stack(br_out_list, 1)
+    # cell_output = tf.stack(cell_output_list, 1) , unused
+    # selected_sbs = tf.stack(selected_sbs_list, 1) , unused
+    # br_out = tf.stack(br_out_list, 1) , unused
 
     return cell_output_list, selected_sbs_list, br_out_list
 
@@ -276,6 +312,33 @@ def dense_to_one_hot(labels_dense, num_classes=2):
     return labels_one_hot
 
 
+def evaluation(m_valid, valid_data_set, sess, num_batches=100):
+
+    # num_samples = valid_data_set.num_samples
+    # num_batches = num_samples / batch_size
+    avg_valid_cost = 0.
+    avg_valid_reward = 0.
+    for i in range(int(num_batches)):
+
+        valid_inputs, valid_labels = valid_data_set.next_batch(batch_size)
+        valid_inputs /= fft_size
+        # print(train_labels.shape[0])
+        valid_onehot_labels = dense_to_one_hot(valid_labels.reshape(-1, 1))
+        valid_onehot_labels = valid_onehot_labels.reshape(-1, num_steps, 2)
+        feed_dict = {m_valid.inputs: np.expand_dims(valid_inputs, axis=3), m_valid.raw_labels: valid_labels,
+                     m_valid.onehot_labels: valid_onehot_labels, m_valid.keep_probability: 1}
+
+        valid_cost, valid_reward = sess.run([m_valid.cost, m_valid.reward], feed_dict=feed_dict)
+
+        avg_valid_cost += valid_cost
+        avg_valid_reward += valid_reward
+
+    avg_valid_cost /= (i + 1)
+    avg_valid_reward /= (i + 1)
+
+    return avg_valid_cost, avg_valid_reward
+
+
 class Model(object):
 
     def __init__(self, is_training=True):
@@ -290,7 +353,7 @@ class Model(object):
         inputs = tf.unstack(inputs, axis=1)  # list length = num_steps, shape = (batch_size, fft_size, channel)
 
         # set inference graph
-        cell_output, selected_sbs, br_out = inference(inputs, self.keep_probability)
+        cell_output, selected_sbs, br_out = inference(inputs, self.keep_probability, is_training=is_training)
         # set objective function
         self.cost, self.reward, self.selected_sbs = cost, reward, selected_sbs\
             = calc_reward(cell_output, br_out, selected_sbs, onehot_labels, raw_labels)
@@ -302,22 +365,48 @@ class Model(object):
 def main(argv=None):
     #                               Graph Part                               #
     print("Graph initialization...")
-    with tf.variable_scope("model", reuse=None):
-        m_train = Model(is_training=True)
+    with tf.device(device):
+        with tf.variable_scope("model", reuse=None):
+            m_train = Model(is_training=True)
+        with tf.variable_scope("model", reuse=True):
+            m_valid = Model(is_training=False)
+    print("Done")
+    #                               Summary Part                             #
+    with tf.variable_scope("summaries"):
+        train_summary_writer = tf.summary.FileWriter(logs_dir + '/train/', max_queue=2)
+        train_summary_list = [tf.summary.scalar("cost", m_train.cost), tf.summary.scalar("reward", m_train.reward)]
+        train_summary_op = tf.summary.merge(train_summary_list)  # training summary
+
+        avg_valid_cost = tf.placeholder(dtype=tf.float32)
+        avg_valid_reward = tf.placeholder(dtype=tf.float32)
+        valid_summary_writer = tf.summary.FileWriter(logs_dir + '/valid/', max_queue=2)
+        valid_summary_list = [tf.summary.scalar("cost", avg_valid_cost), tf.summary.scalar("reward", avg_valid_reward)]
+        valid_summary_op = tf.summary.merge(valid_summary_list)  # validation summary
+    #                               Model Save Part                             #
+    print("Setting up Saver...")
+    saver = tf.train.Saver()
+    ckpt = tf.train.get_checkpoint_state(logs_dir)
     print("Done")
     #                               Session Part                             #
-
     sess_config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=False)
     sess_config.gpu_options.allow_growth = True
     sess = tf.Session(config=sess_config)
-    sess.run(tf.global_variables_initializer())
 
-    data_set = dr.DataReader(input_dir, output_dir, num_steps=num_steps)
+    if ckpt and ckpt.model_checkpoint_path:  # model restore
+        saver.restore(sess, ckpt.model_checkpoint_path)
+        print("Model restored...")
+    else:
+        sess.run(tf.global_variables_initializer())  # if the checkpoint doesn't exist, do initialization
+
+    data_set = dr.DataReader(input_dir, output_dir, num_steps=num_steps,
+                             name="train")  # training data reader initialization
+    # data_set._num_file = 5
+    valid_data_set = dr.DataReader(valid_input_dir, valid_output_dir,
+                                   num_steps=num_steps, name="valid")  # validation data reader initialization
 
     for itr in range(max_epoch):
         train_inputs, train_labels = data_set.next_batch(batch_size)
         train_inputs /= fft_size
-       # print(train_labels.shape[0])
         train_onehot_labels = dense_to_one_hot(train_labels.reshape(-1, 1))
         train_onehot_labels = train_onehot_labels.reshape(-1, num_steps, 2)
         feed_dict = {m_train.inputs: np.expand_dims(train_inputs, axis=3), m_train.raw_labels: train_labels,
@@ -326,14 +415,22 @@ def main(argv=None):
         sess.run(m_train.train_op, feed_dict=feed_dict)
 
         if itr % 20 == 0:
-            train_cost, train_reward = sess.run([m_train.cost, m_train.reward], feed_dict=feed_dict)
+            train_cost, train_reward, train_summary_str = sess.run([m_train.cost, m_train.reward, train_summary_op],
+                                                                   feed_dict=feed_dict)
             print("Step: %d, train_cost: %.5f, train_reward: %.5f" % (itr, train_cost, train_reward))
 
-            # train_selected_sbs = sess.run([m_train.selected_sbs], feed_dict=feed_dict)
-            # print("selected sub-bands : ")
-            # print(train_selected_sbs)
+            train_summary_writer.add_summary(train_summary_str, itr)  # write the train phase summary to event files
 
+        if itr % 500 == 0:
+            saver.save(sess, logs_dir + "/model.ckpt", itr)  # model save
 
+            valid_cost, valid_reward = evaluation(m_valid, valid_data_set, sess, num_valid_batches)
+
+            print("valid_cost: %.5f, valid_reward: %.5f" % (valid_cost, valid_reward))
+
+            valid_summary_str = sess.run(valid_summary_op, feed_dict={avg_valid_cost: valid_cost,
+                                                                      avg_valid_reward: valid_reward})
+            valid_summary_writer.add_summary(valid_summary_str, itr)
 if __name__ == "__main__":
     tf.app.run()
 

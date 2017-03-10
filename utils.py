@@ -69,6 +69,7 @@ def get_variable(weights, name):
 def weight_variable(shape, stddev=0.02, name=None):
     # print(shape)
     initial = tf.truncated_normal(shape, stddev=stddev)
+    #initial = tf.contrib.layers.xavier_initializer_conv2d()
     if name is None:
         return tf.Variable(initial)
     else:
@@ -293,3 +294,16 @@ def conv2lstm_layer(inputs, num_fm):
     outputs = tf.nn.relu(conv_last, name="last_relu")
     return outputs
 
+
+def batch_norm_affine_transform(x, output_dim, decay=0, name=None, is_training=True):
+    """
+    affine transformation Wx+b
+    assumes x.shape = (batch_size, num_features)
+    """
+
+    w = tf.get_variable(name+"_w", [x.get_shape()[1], output_dim], initializer=tf.contrib.layers.xavier_initializer())
+    b = tf.get_variable(name+"_b", [output_dim], initializer=tf.constant_initializer(0.0))
+    affine_result = tf.matmul(x, w) + b
+    batch_norm_result = tf.contrib.layers.batch_norm(affine_result, decay=decay, is_training=is_training,
+                                                     updates_collections=None)
+    return batch_norm_result
